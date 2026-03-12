@@ -257,10 +257,13 @@ func HandleAGUIRunProxy(c *gin.Context) {
 
 	log.Printf("AGUI Proxy: run=%s session=%s/%s msgs=%d", truncID(runID), projectName, sessionName, len(rawMessages))
 
+	// Use namespace-qualified session ID to avoid cross-project collisions
+	namespacedSessionID := projectName + "/" + sessionName
+
 	sessionLastSeen.Store(sessionName, time.Now())
 
 	// Store project→session mapping for activity tracking in persistStreamedEvent
-	sessionProjectMap.Store(sessionName, projectName)
+	sessionProjectMap.Store(namespacedSessionID, projectName)
 
 	// Resolve and cache the runner port for this session from the registry.
 	cacheSessionPort(projectName, sessionName)
@@ -297,7 +300,7 @@ func HandleAGUIRunProxy(c *gin.Context) {
 	runnerURL := getRunnerEndpoint(projectName, sessionName)
 
 	// Start background goroutine to proxy runner SSE → persist + broadcast
-	go proxyRunnerStream(runnerURL, bodyBytes, sessionName, runID, threadID)
+	go proxyRunnerStream(runnerURL, bodyBytes, sessionName, namespacedSessionID, runID, threadID)
 
 	// Return metadata immediately — events arrive via GET /agui/events
 	c.JSON(http.StatusOK, gin.H{
@@ -309,13 +312,14 @@ func HandleAGUIRunProxy(c *gin.Context) {
 // proxyRunnerStream connects to the runner's SSE endpoint, reads events,
 // persists them, and publishes them to the live broadcast pipe.  Runs in
 // a background goroutine so the POST /agui/run handler can return immediately.
-func proxyRunnerStream(runnerURL string, bodyBytes []byte, sessionName, runID, threadID string) {
+// namespacedSessionID is the namespace-qualified session ID (e.g., "namespace/sessionName") for event persistence.
+func proxyRunnerStream(runnerURL string, bodyBytes []byte, sessionName, namespacedSessionID, runID, threadID string) {
 	log.Printf("AGUI Proxy: connecting to runner at %s", runnerURL)
 	resp, err := connectToRunner(runnerURL, bodyBytes)
 	if err != nil {
 		log.Printf("AGUI Proxy: runner unavailable for %s: %v", sessionName, err)
 		// Publish error events so GET /agui/events subscribers see the failure
-		publishAndPersistErrorEvents(sessionName, runID, threadID, "Runner is not available")
+		publishAndPersistErrorEvents(sessionName, namespacedSessionID, runID, threadID, "Runner is not available")
 		return
 	}
 	defer resp.Body.Close()
@@ -323,7 +327,7 @@ func proxyRunnerStream(runnerURL string, bodyBytes []byte, sessionName, runID, t
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		log.Printf("AGUI Proxy: runner returned %d: %s", resp.StatusCode, string(body))
-		publishAndPersistErrorEvents(sessionName, runID, threadID, fmt.Sprintf("Runner error: HTTP %d", resp.StatusCode))
+		publishAndPersistErrorEvents(sessionName, namespacedSessionID, runID, threadID, fmt.Sprintf("Runner error: HTTP %d", resp.StatusCode))
 		return
 	}
 
@@ -343,7 +347,7 @@ func proxyRunnerStream(runnerURL string, bodyBytes []byte, sessionName, runID, t
 		// Persist every data event to JSONL
 		if strings.HasPrefix(trimmed, "data: ") {
 			jsonData := strings.TrimPrefix(trimmed, "data: ")
-			persistStreamedEvent(sessionName, runID, threadID, jsonData)
+			persistStreamedEvent(namespacedSessionID, runID, threadID, jsonData)
 		}
 
 		// Publish raw SSE line to all GET /agui/events subscribers
@@ -356,14 +360,15 @@ func proxyRunnerStream(runnerURL string, bodyBytes []byte, sessionName, runID, t
 // publishAndPersistErrorEvents generates RUN_STARTED + RUN_ERROR events,
 // persists them, and publishes to the live broadcast so subscribers get
 // notified of runner failures.
-func publishAndPersistErrorEvents(sessionName, runID, threadID, message string) {
+// sessionName is used for broadcasting; namespacedSessionID is used for persistence.
+func publishAndPersistErrorEvents(sessionName, namespacedSessionID, runID, threadID, message string) {
 	// RUN_STARTED
 	startEvt := map[string]interface{}{
 		"type":     "RUN_STARTED",
 		"threadId": threadID,
 		"runId":    runID,
 	}
-	persistEvent(sessionName, startEvt)
+	persistEvent(namespacedSessionID, startEvt)
 	startData, _ := json.Marshal(startEvt)
 	publishLine(sessionName, fmt.Sprintf("data: %s\n\n", startData))
 
@@ -374,7 +379,7 @@ func publishAndPersistErrorEvents(sessionName, runID, threadID, message string) 
 		"threadId": threadID,
 		"runId":    runID,
 	}
-	persistEvent(sessionName, errEvt)
+	persistEvent(namespacedSessionID, errEvt)
 	errData, _ := json.Marshal(errEvt)
 	publishLine(sessionName, fmt.Sprintf("data: %s\n\n", errData))
 }
@@ -436,15 +441,19 @@ func persistStreamedEvent(sessionID, runID, threadID, jsonData string) {
 
 	persistEvent(sessionID, event)
 
-	// Update lastActivityTime on CR for activity events (debounced).
-	// Extract event type to check; projectName is derived from the
+	// Extract event type; projectName is derived from the
 	// sessionID-to-project mapping populated by HandleAGUIRunProxy.
 	eventType, _ := event["type"].(string)
+
+	// Update lastActivityTime on CR for activity events (debounced).
 	if isActivityEvent(eventType) {
 		if projectName, ok := sessionProjectMap.Load(sessionID); ok {
 			updateLastActivityTime(projectName.(string), sessionID, eventType == types.EventTypeRunStarted)
 		}
 	}
+
+	// agentStatus is derived at query time from the event log (DeriveAgentStatus).
+	// No CR updates needed here — the persisted events ARE the source of truth.
 }
 
 // ─── POST /agui/interrupt ────────────────────────────────────────────
@@ -944,4 +953,17 @@ func updateLastActivityTime(projectName, sessionName string, immediate bool) {
 			log.Printf("Activity tracking: failed to update lastActivityTime for %s/%s: %v", projectName, sessionName, err)
 		}
 	}()
+}
+
+// isAskUserQuestionToolCall checks if a tool call name is the AskUserQuestion HITL tool.
+// Uses case-insensitive comparison after stripping non-alpha characters,
+// matching the frontend pattern in use-agent-status.ts.
+func isAskUserQuestionToolCall(name string) bool {
+	var clean strings.Builder
+	for _, r := range strings.ToLower(name) {
+		if r >= 'a' && r <= 'z' {
+			clean.WriteRune(r)
+		}
+	}
+	return clean.String() == "askuserquestion"
 }
