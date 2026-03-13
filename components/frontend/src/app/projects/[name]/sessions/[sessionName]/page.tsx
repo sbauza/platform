@@ -79,7 +79,7 @@ import { WorkflowsAccordion } from "./components/accordions/workflows-accordion"
 import { RepositoriesAccordion } from "./components/accordions/repositories-accordion";
 import { ArtifactsAccordion } from "./components/accordions/artifacts-accordion";
 import { McpServersAccordion, IntegrationsAccordion } from "./components/accordions/mcp-integrations-accordion";
-import { WelcomeExperience } from "./components/welcome-experience";
+
 // Extracted hooks and utilities
 import { useGitOperations } from "./hooks/use-git-operations";
 import { useWorkflowManagement } from "./hooks/use-workflow-management";
@@ -1237,9 +1237,16 @@ export default function ProjectSessionDetailPage({
           setUserHasInteracted(true);
         }
       } else {
-        // No matching OOTB workflow found - treat as custom workflow
+        // No matching OOTB workflow found - treat as custom workflow.
+        // Restore the full custom workflow details from the session CR
+        // so they survive page refresh.
+        const aw = session.spec.activeWorkflow;
+        workflowManagement.setCustomWorkflow(
+          aw.gitUrl,
+          aw.branch || "main",
+          aw.path || ""
+        );
         workflowManagement.setActiveWorkflow("custom");
-        workflowManagement.setSelectedWorkflow("custom");
         if (hasRealMessages) {
           setUserHasInteracted(true);
         }
@@ -2652,27 +2659,12 @@ export default function ProjectSessionDetailPage({
                         workflowMetadata={workflowMetadata}
                         onCommandClick={handleCommandClick}
                         isRunActive={isRunActive}
-                        showWelcomeExperience={session?.status?.phase === "Running"}
-                        activeWorkflow={workflowManagement.activeWorkflow}
-                        userHasInteracted={userHasInteracted}
                         queuedMessages={sessionQueue.messages}
                         hasRealMessages={hasRealMessages}
                         onCancelQueuedMessage={sessionQueue.cancelMessage}
                         onUpdateQueuedMessage={sessionQueue.updateMessage}
                         onClearQueue={sessionQueue.clearMessages}
                         agentName={agentName}
-                        welcomeExperienceComponent={
-                          <WelcomeExperience
-                            ootbWorkflows={ootbWorkflows}
-                            onWorkflowSelect={handleWelcomeWorkflowSelect}
-                            onUserInteraction={() => setUserHasInteracted(true)}
-                            userHasInteracted={userHasInteracted}
-                            sessionPhase={session?.status?.phase}
-                            hasRealMessages={hasRealMessages}
-                            onLoadWorkflow={() => setCustomWorkflowDialogOpen(true)}
-                            selectedWorkflow={workflowManagement.selectedWorkflow}
-                          />
-                        }
                       />
                       </FeedbackProvider>
                     </div>
@@ -2732,26 +2724,11 @@ export default function ProjectSessionDetailPage({
                           onCommandClick={handleCommandClick}
                           agentName={agentName}
                           isRunActive={isRunActive}
-                          showWelcomeExperience={session?.status?.phase === "Running"}
-                          activeWorkflow={workflowManagement.activeWorkflow}
-                          userHasInteracted={userHasInteracted}
                           queuedMessages={sessionQueue.messages}
                           hasRealMessages={hasRealMessages}
                           onCancelQueuedMessage={sessionQueue.cancelMessage}
                           onUpdateQueuedMessage={sessionQueue.updateMessage}
                           onClearQueue={sessionQueue.clearMessages}
-                          welcomeExperienceComponent={
-                            <WelcomeExperience
-                              ootbWorkflows={ootbWorkflows}
-                              onWorkflowSelect={handleWelcomeWorkflowSelect}
-                              onUserInteraction={() => setUserHasInteracted(true)}
-                              userHasInteracted={userHasInteracted}
-                              sessionPhase={session?.status?.phase}
-                              hasRealMessages={hasRealMessages}
-                              onLoadWorkflow={() => setCustomWorkflowDialogOpen(true)}
-                              selectedWorkflow={workflowManagement.selectedWorkflow}
-                            />
-                          }
                         />
                       </FeedbackProvider>
                     </div>
