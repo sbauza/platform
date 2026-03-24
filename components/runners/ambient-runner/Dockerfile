@@ -62,6 +62,15 @@ RUN dnf install -y go-toolset && \
 # Install uv (provides uvx for package execution) and pre-commit (for repo hooks)
 RUN pip install --no-cache-dir uv pre-commit
 
+# Install Gerrit MCP server (code review integration for Gerrit-based communities)
+# Pinned to specific commit for reproducibility
+RUN git clone https://gerrit.googlesource.com/gerrit-mcp-server /opt/gerrit-mcp-server && \
+    cd /opt/gerrit-mcp-server && \
+    git checkout 5666642afe1a5217e2529225d4bd9c9df6310bd6 && \
+    ./build-gerrit.sh && \
+    chown -R 1001:0 /opt/gerrit-mcp-server && \
+    chmod -R g=u /opt/gerrit-mcp-server
+
 # Create working directory
 WORKDIR /app
 

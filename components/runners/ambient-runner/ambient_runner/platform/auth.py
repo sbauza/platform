@@ -256,6 +256,19 @@ async def fetch_gitlab_token(context: RunnerContext) -> str:
     return data.get("token", "")
 
 
+async def fetch_gerrit_credentials(context: RunnerContext) -> list[dict]:
+    """Fetch all Gerrit instance credentials from backend API.
+
+    Returns list of instance dicts with: instanceName, url, authMethod,
+    username, httpToken, gitcookiesContent
+    """
+    data = await _fetch_credential(context, "gerrit")
+    instances = data.get("instances", [])
+    if instances:
+        logger.info(f"Fetched Gerrit credentials for {len(instances)} instance(s)")
+    return instances
+
+
 async def fetch_token_for_url(context: RunnerContext, url: str) -> str:
     """Fetch appropriate token based on repository URL host."""
     try:
@@ -278,11 +291,12 @@ async def populate_runtime_credentials(context: RunnerContext) -> None:
     logger.info("Fetching fresh credentials from backend API...")
 
     # Fetch all credentials concurrently
-    google_creds, jira_creds, gitlab_creds, github_creds = await asyncio.gather(
+    google_creds, jira_creds, gitlab_creds, github_creds, gerrit_instances = await asyncio.gather(
         fetch_google_credentials(context),
         fetch_jira_credentials(context),
         fetch_gitlab_credentials(context),
         fetch_github_credentials(context),
+        fetch_gerrit_credentials(context),
         return_exceptions=True,
     )
 
@@ -353,6 +367,17 @@ async def populate_runtime_credentials(context: RunnerContext) -> None:
         if github_creds.get("email"):
             git_user_email = github_creds["email"]
 
+    # Gerrit credentials (generate config file for MCP server)
+    if isinstance(gerrit_instances, Exception):
+        logger.warning(f"Failed to fetch Gerrit credentials: {gerrit_instances}")
+    elif gerrit_instances:
+        try:
+            from ambient_runner.bridges.claude.mcp import generate_gerrit_config
+            generate_gerrit_config(gerrit_instances)
+            logger.info("Generated Gerrit MCP config from backend credentials")
+        except Exception as e:
+            logger.warning(f"Failed to generate Gerrit config: {e}")
+
     # Configure git identity from provider credentials
     await configure_git_identity(git_user_name, git_user_email)
 
@@ -383,6 +408,19 @@ def clear_runtime_credentials() -> None:
     for key in mcp_cred_keys:
         os.environ.pop(key, None)
         cleared.append(key)
+
+    # Remove Gerrit config and gitcookies files
+    gerrit_config_path = os.environ.pop("GERRIT_CONFIG_PATH", None)
+    if gerrit_config_path:
+        cleared.append("GERRIT_CONFIG_PATH")
+    gerrit_dir = Path("/tmp/gerrit-mcp")
+    if gerrit_dir.exists():
+        try:
+            import shutil
+            shutil.rmtree(gerrit_dir)
+            cleared.append("gerrit_config_files")
+        except OSError as e:
+            logger.warning(f"Failed to remove Gerrit config directory: {e}")
 
     # Remove Google Workspace credential file if present (uses same hardcoded path as populate_runtime_credentials)
     google_cred_file = _GOOGLE_WORKSPACE_CREDS_FILE
