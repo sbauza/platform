@@ -14,8 +14,9 @@ import os
 import time
 from typing import Any, AsyncIterator, Optional
 
-from ag_ui.core import BaseEvent, RunAgentInput
+from ag_ui.core import BaseEvent, EventType, RunAgentInput, RunStartedEvent, RunFinishedEvent
 from ag_ui_claude_sdk import ClaudeAgentAdapter
+from ag_ui_claude_sdk.adapter import now_ms
 
 from ambient_runner.bridge import (
     FrameworkCapabilities,
@@ -242,6 +243,123 @@ class ClaudeBridge(PlatformBridge):
         # Record interrupt in observability metrics
         if self._obs:
             self._obs.record_interrupt()
+
+    async def stop_task(self, task_id: str, thread_id: Optional[str] = None) -> None:
+        """Stop a background task (subagent) by ID."""
+        if not self._session_manager:
+            raise RuntimeError("No active session manager")
+
+        tid = thread_id or (self._context.session_id if self._context else None)
+        if not tid:
+            raise RuntimeError("No thread_id available")
+
+        worker = self._session_manager.get_existing(tid)
+        if not worker:
+            raise RuntimeError(f"No active session for thread {tid}")
+
+        await worker.stop_task(task_id)
+
+    async def stream_between_run_events(
+        self, thread_id: str
+    ) -> AsyncIterator[BaseEvent]:
+        """Yield AG-UI events for SDK messages arriving between user runs."""
+        import asyncio
+
+        # Wait for session manager and adapter to be ready
+        for _ in range(120):  # up to 60 seconds
+            if self._session_manager and self._adapter:
+                break
+            await asyncio.sleep(0.5)
+        else:
+            return
+
+        # Wait for worker to be created (it's created during the first run)
+        worker = None
+        for _ in range(120):
+            worker = self._session_manager.get_existing(thread_id)
+            if worker:
+                break
+            await asyncio.sleep(0.5)
+
+        if not worker:
+            return
+
+        import uuid as _uuid
+        from claude_agent_sdk import (
+            TaskStartedMessage,
+            TaskProgressMessage,
+            TaskNotificationMessage,
+            ResultMessage,
+        )
+
+        # Between-run messages form complete SDK turns (init → stream →
+        # assistant → result).  We pipe non-task messages through the
+        # normal _stream_claude_sdk adapter so StreamEvents are processed
+        # with full text streaming, wrapped in a synthetic AG-UI run.
+
+        while True:
+            msg = await worker.between_run_queue_get()
+            if msg is None:
+                return
+
+            # Task lifecycle → CUSTOM events, no run envelope needed
+            if isinstance(msg, (TaskStartedMessage, TaskProgressMessage, TaskNotificationMessage)):
+                yield self._adapter._emit_task_event(msg)
+                for hook_evt in self._adapter.drain_hook_events():
+                    yield hook_evt
+                continue
+
+            # First non-task message — open a synthetic run and pipe
+            # this + subsequent messages through _stream_claude_sdk.
+            synthetic_run_id = str(_uuid.uuid4())
+
+            yield RunStartedEvent(
+                type=EventType.RUN_STARTED,
+                thread_id=thread_id,
+                run_id=synthetic_run_id,
+                timestamp=now_ms(),
+                parent_run_id=self._adapter._last_run_id,
+            )
+
+            async def _between_run_stream(first_msg):
+                yield first_msg
+                async for m in worker.between_run_events():
+                    yield m
+                    if isinstance(m, ResultMessage):
+                        return
+
+            try:
+                async for event in self._adapter._stream_claude_sdk(
+                    prompt="",
+                    thread_id=thread_id,
+                    run_id=synthetic_run_id,
+                    input_data=None,
+                    frontend_tool_names=set(),
+                    message_stream=_between_run_stream(msg),
+                ):
+                    yield event
+            finally:
+                self._adapter._last_run_id = synthetic_run_id
+                yield RunFinishedEvent(
+                    type=EventType.RUN_FINISHED,
+                    thread_id=thread_id,
+                    run_id=synthetic_run_id,
+                    timestamp=now_ms(),
+                )
+
+    @property
+    def task_registry(self) -> dict:
+        """Background task metadata tracked by the adapter."""
+        if self._adapter:
+            return getattr(self._adapter, "_task_registry", {})
+        return {}
+
+    @property
+    def task_outputs(self) -> dict:
+        """Background task output file paths tracked by the adapter."""
+        if self._adapter:
+            return getattr(self._adapter, "_task_outputs", {})
+        return {}
 
     # ------------------------------------------------------------------
     # Lifecycle methods
